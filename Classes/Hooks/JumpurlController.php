@@ -16,6 +16,7 @@ namespace DirectMailTeam\DirectMail\Hooks;
 
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Utility\MathUtility;
+use TYPO3\CMS\Core\Database\ConnectionPool;
 
 /**
  * JumpUrl processing hook on TYPO3\CMS\Frontend\Http\RequestHandler
@@ -36,8 +37,6 @@ class JumpurlController
      */
     public function preprocessRequest($parameter, $parentObject)
     {
-        $db = $this->getDatabaseConnection();
-
         $jumpUrlVariables = GeneralUtility::_GET();
 
         $mid = $jumpUrlVariables['mid'];
@@ -61,14 +60,17 @@ class JumpurlController
 
             if (MathUtility::canBeInterpretedAsInteger($jumpurl)) {
 
-                    // fetch the direct mail record where the mailing was sent (for this message)
-                $resMailing = $db->exec_SELECTquery(
-                    'mailContent, page, authcode_fieldList',
-                    'sys_dmail',
-                    'uid = ' . intval($mid)
-                );
 
-                if (($row = $db->sql_fetch_assoc($resMailing))) {
+                $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable('sys_dmail');
+                $resMailing = $queryBuilder->select('mailContent','page','authcode_fieldList')
+                    ->from('sys_dmail')
+                    ->where(
+                        $queryBuilder->expr()->eq('uid', $queryBuilder->createNamedParameter($mid, \PDO::PARAM_INT))
+                    )
+                    ->execute()
+                    ->fetchAll();
+
+                foreach ($resMailing as  $row) {
                     $mailContent = unserialize(base64_decode($row['mailContent']));
                     $urlId = $jumpurl;
                     if ($jumpurl >= 0) {
@@ -96,7 +98,7 @@ class JumpurlController
                     if ($theTable) {
                         $recipRow = $this->getRawRecord($theTable, $recipientUid);
                         if (is_array($recipRow)) {
-                            $authCode = GeneralUtility::stdAuthCode($recipRow, ($row['authcode_fieldList'] ? $row['authcode_fieldList'] : 'uid'));
+                            $authCode = GeneralUtility::stdAuthCode($recipRow[0], ($row['authcode_fieldList'] ? $row['authcode_fieldList'] : 'uid'));
 
                             // check if supplied aC identical with counted authCode
                             if (($aC != '') && ($aC == $authCode)) {
@@ -107,7 +109,7 @@ class JumpurlController
 
                                 reset($rowFieldsArray);
                                 foreach ($rowFieldsArray as $substField) {
-                                    $jumpurl = str_replace('###USER_' . $substField . '###', $recipRow[$substField], $jumpurl);
+                                    $jumpurl = str_replace('###USER_' . $substField . '###', $recipRow[0][$substField], $jumpurl);
                                 }
                                 // Put in the tablename of the userinformation
                                 $jumpurl = str_replace('###SYS_TABLE_NAME###', substr($theTable, 0, 1), $jumpurl);
@@ -121,18 +123,17 @@ class JumpurlController
                                 // in the authcode_fieldlist the field "password" is computed in as well
                                 // TODO: add a switch in Direct Mail configuration to decide if this option should be enabled by default
                                 if ($theTable == 'fe_users' && $aC != '' && $aC == $authCode && GeneralUtility::inList($row['authcode_fieldList'], 'password')) {
-                                    $_POST['user'] = $recipRow['username'];
-                                    $_POST['pass'] = $recipRow['password'];
-                                    $_POST['pid']  = $recipRow['pid'];
+                                    $_POST['user'] = $recipRow[0]['username'];
+                                    $_POST['pass'] = $recipRow[0]['password'];
+                                    $_POST['pid']  = $recipRow[0]['pid'];
                                     $_POST['logintype'] = 'login';
                                 }
                             } else {
-                                throw new \Exception('authCode: Calculated authCode did not match the submitted authCode.', 1376899631);
+                                throw new \Exception('authCode: Calculated authCode did not match the submitted authCode. varDump = '.var_dump($recipRow).' $recipientUid = '.$recipientUid.' theTable = '.$theTable.' authcode_fieldList'.$row['authcode_fieldList'].' AC = '. $aC .' AuthCode = '. $authCode, 1376899631);
                             }
                         }
                     }
                 }
-                $db->sql_free_result($resMailing);
                 if (!$jumpurl) {
                     die('Error: No further link. Please report error to the mail sender.');
                 } else {
@@ -167,18 +168,21 @@ class JumpurlController
             }
 
             if ($responseType != 0) {
-                $insertFields = array(
-                    // the message ID
-                    'mid'           => intval($mid),
-                    'tstamp'        => time(),
-                    'url'           => $jumpurl,
-                    'response_type' => intval($responseType),
-                    'url_id'        => intval($urlId),
-                    'rtbl'            => $recipientTable,
-                    'rid'            => $recipientUid
-                );
 
-                $db->exec_INSERTquery('sys_dmail_maillog', $insertFields);
+                $connectionPool = GeneralUtility::makeInstance(ConnectionPool::class);
+                $databaseConnectionSysDamilMaillog = $connectionPool->getConnectionForTable('sys_dmail_maillog');
+                $databaseConnectionSysDamilMaillog->insert(
+                    'sys_dmail_maillog',
+                    [
+                        'mid'           => intval($mid),
+                        'tstamp'        => time(),
+                        'url'           => $jumpurl,
+                        'response_type' => intval($responseType),
+                        'url_id'        => intval($urlId),
+                        'rtbl'            => $recipientTable,
+                        'rid'            => $recipientUid
+                    ]
+                );
             }
         }
 
@@ -202,9 +206,17 @@ class JumpurlController
     {
         $uid = (int)$uid;
         if ($uid > 0) {
-            $res = $this->getDatabaseConnection()->exec_SELECTquery($fields, $table, 'uid = ' . $uid . ' AND deleted = 0');
-            $row = $this->getDatabaseConnection()->sql_fetch_assoc($res);
-            $this->getDatabaseConnection()->sql_free_result($res);
+            $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable($table);
+            $res = $queryBuilder->select($fields)
+                ->from($table)
+                ->where(
+                    $queryBuilder->expr()->eq('uid', $queryBuilder->createNamedParameter($uid, \PDO::PARAM_INT)),
+                    $queryBuilder->expr()->eq('deleted', $queryBuilder->createNamedParameter(0))
+                )
+                ->execute();
+
+            $row = $res->fetchAll();
+
             if ($row) {
                 if (is_array($row)) {
                     return $row;
@@ -214,13 +226,5 @@ class JumpurlController
         return 0;
     }
 
-    /**
-     * Get the DB global object
-     *
-     * @return \TYPO3\CMS\Core\Database\DatabaseConnection
-     */
-    protected function getDatabaseConnection()
-    {
-        return $GLOBALS['TYPO3_DB'];
-    }
+
 }
